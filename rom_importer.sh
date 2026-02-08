@@ -69,6 +69,7 @@ show_status() {
 
 build_ext_map() {
   declare -gA EXT_TO_ROM=()
+  declare -gA EXT_TO_ROMS=()
 
   if [ ! -d "$ROMS" ]; then
     log "ROMs folder not found: $ROMS"
@@ -102,6 +103,11 @@ build_ext_map() {
       if [ -z "${EXT_TO_ROM[$ext]+x}" ]; then
         EXT_TO_ROM["$ext"]="$system_dir"
       fi
+      if [ -n "${EXT_TO_ROMS[$ext]+x}" ]; then
+        EXT_TO_ROMS["$ext"]="${EXT_TO_ROMS[$ext]}|$system_dir"
+      else
+        EXT_TO_ROMS["$ext"]="$system_dir"
+      fi
     done
   done
 }
@@ -134,6 +140,58 @@ unique_target_path() {
   printf '%s/%s_dup_%s%s' "$dir" "$base" "$stamp" "$ext"
 }
 
+unique_target_dir_path() {
+  local target="$1"
+  if [ ! -e "$target" ]; then
+    printf '%s' "$target"
+    return
+  fi
+  local dir base stamp
+  dir="$(dirname "$target")"
+  base="$(basename "$target")"
+  stamp="$(date '+%Y%m%d%H%M%S')"
+  printf '%s/%s_dup_%s' "$dir" "$base" "$stamp"
+}
+
+list_contains() {
+  local list="$1"
+  local item="$2"
+  case "|$list|" in
+    *"|$item|"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+list_intersect() {
+  local left="$1"
+  local right="$2"
+  local result=""
+  local item
+  for item in ${left//|/ }; do
+    if list_contains "$right" "$item"; then
+      if [ -z "$result" ]; then
+        result="$item"
+      else
+        result="${result}|$item"
+      fi
+    fi
+  done
+  printf '%s' "$result"
+}
+
+is_ps1_dir() {
+  local path
+  path="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$path" in
+    */psx|*/psx/*|*/ps1|*/ps1/*|*/psone|*/psone/*|*/playstation|*/playstation/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 move_if_supported() {
   local file="$1"
   local filename ext target_dir target_path
@@ -157,13 +215,129 @@ move_if_supported() {
   log "Moved $filename -> $target_dir"
 }
 
+folder_target_dirs() {
+  local folder="$1"
+  local target_dir="" candidate ext filename
+  local has_cue=0
+  local has_bin=0
+
+  while IFS= read -r -d '' file; do
+    filename="$(basename "$file")"
+    if [[ "$filename" == .* ]]; then
+      continue
+    fi
+    if [[ "$filename" != *.* ]]; then
+      return 1
+    fi
+
+    ext=".${filename##*.}"
+    ext="$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')"
+    if [ "$ext" = ".cue" ]; then
+      has_cue=1
+    elif [ "$ext" = ".bin" ]; then
+      has_bin=1
+    fi
+
+    candidate="${EXT_TO_ROMS[$ext]-}"
+    if [ -z "$candidate" ]; then
+      return 1
+    fi
+
+    if [ -z "$target_dir" ]; then
+      target_dir="$candidate"
+    else
+      target_dir="$(list_intersect "$target_dir" "$candidate")"
+      if [ -z "$target_dir" ]; then
+        return 1
+      fi
+    fi
+  done < <(find "$folder" -type f -print0)
+
+  if [ -z "$target_dir" ]; then
+    return 1
+  fi
+
+  if [[ "$target_dir" == *"|"* ]]; then
+    if [ "$has_cue" -eq 1 ] && [ "$has_bin" -eq 1 ]; then
+      local item match=""
+      for item in ${target_dir//|/ }; do
+        if is_ps1_dir "$item"; then
+          match="$item"
+          break
+        fi
+      done
+      if [ -n "$match" ]; then
+        printf '%s' "$match"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '%s' "$target_dir"
+}
+
+move_folder_if_supported() {
+  local folder="$1"
+  local target_dirs target_dir
+  local has_multiple=0
+  local copied_all=1
+
+  target_dirs="$(folder_target_dirs "$folder" || true)"
+  if [ -z "$target_dirs" ]; then
+    return 1
+  fi
+
+  if [[ "$target_dirs" == *"|"* ]]; then
+    has_multiple=1
+  fi
+
+  for target_dir in ${target_dirs//|/ }; do
+    mkdir -p "$target_dir"
+    while IFS= read -r -d '' file; do
+      local filename dest_path
+      filename="$(basename "$file")"
+      if [[ "$filename" == .* ]]; then
+        continue
+      fi
+      dest_path="$(unique_target_path "$target_dir/$filename")"
+      if ! cp -a "$file" "$dest_path"; then
+        copied_all=0
+        break
+      fi
+    done < <(find "$folder" -type f -print0)
+    if [ "$copied_all" -eq 0 ]; then
+      break
+    fi
+    log "Copied files from $(basename "$folder") -> $target_dir"
+  done
+
+  if [ "$copied_all" -eq 1 ]; then
+    rm -rf "$folder"
+    log "Removed source folder $(basename "$folder") after copy"
+    return 0
+  fi
+  return 1
+}
+
 process_extracted_folder() {
   local folder="$1"
-  local start_ts end_ts
+  local start_ts end_ts file_count
 
   ensure_ext_map
   if [ "${#EXT_TO_ROM[@]}" -eq 0 ]; then
     log "No supported extensions found in ROMs folders."
+    return
+  fi
+
+  file_count="$(find "$folder" -type f | wc -l | tr -d ' ')"
+  if [ "$file_count" -gt 1 ]; then
+    start_ts="$(date +%s)"
+    if move_folder_if_supported "$folder"; then
+      end_ts="$(date +%s)"
+      log "Processed extracted folder in $((end_ts - start_ts))s"
+      return
+    fi
+    log "Folder $folder has mixed or unsupported extensions; leaving as-is."
     return
   fi
 
@@ -200,6 +374,10 @@ process_zip() {
   local base dest marker
 
   base="$(basename "$zip")"
+  if [[ "$base" == .pending-* ]]; then
+    log "Skipping pending download $base"
+    return
+  fi
   base="${base%.*}"
   dest="$DOWNLOADS/$base"
   marker="$DOWNLOADS/.${base}.extracted.ok"
@@ -213,6 +391,9 @@ process_zip() {
   if ! extract_zip "$zip" "$dest"; then
     return
   fi
+
+  rm -f "$zip"
+  log "Deleted zip $zip"
 
   touch "$marker"
   process_extracted_folder "$dest"
